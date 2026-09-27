@@ -194,7 +194,7 @@ test("unconfirmed child can restart once exit is confirmed", async () => {
 				// After child exit confirmation and automatic recovery,
 				// start() should succeed without throwing "exit remains unconfirmed"
 				await value.start();
-				break;  // Successfully restarted
+				break; // Successfully restarted
 			} catch (e) {
 				if (Date.now() >= deadline) throw e;
 				await Bun.sleep(10);
