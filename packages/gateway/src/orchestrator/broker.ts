@@ -268,6 +268,8 @@ export class GlobalGjcClient {
 	#identity: string | undefined;
 	#available = false;
 	#stopped = false;
+	#stoppedAtEpoch: number | undefined; // When stopped due to involuntary termination failure
+	#stoppedAtTime: number | undefined; // Time when involuntary stop occurred
 	#started = false;
 	#epoch = 0;
 	#failures = 0;
@@ -383,6 +385,8 @@ export class GlobalGjcClient {
 	}
 	async stop(): Promise<void> {
 		this.#stopped = true;
+		this.#stoppedAtEpoch = undefined; // Clear involuntary stop markers
+		this.#stoppedAtTime = undefined;
 		this.#started = false;
 		this.#available = false;
 		this.#outageSince = undefined;
@@ -412,12 +416,17 @@ export class GlobalGjcClient {
 		const termination = terminateChild(child)
 			.catch((error: unknown) => {
 				// Unconfirmed children must not overlap a replacement client generation.
+				// Mark involuntary stop and keep observation running so the #246 guard
+				// (onLiveOutageExceeded) can trigger if the child stays unconfirmed too long.
 				this.#stopped = true;
+				this.#stoppedAtEpoch = this.#epoch; // Mark involuntary stop
+				this.#stoppedAtTime = Date.now();
 				this.#started = false;
 				this.#available = false;
 				++this.#epoch;
 				if (this.#timer) clearTimeout(this.#timer);
 				this.#timer = undefined;
+				this.#schedule(this.#epoch);
 				throw error;
 			})
 			.finally(() => {
@@ -492,24 +501,41 @@ export class GlobalGjcClient {
 		}
 	}
 	#schedule(epoch: number): void {
-		if (this.#stopped || epoch !== this.#epoch) return;
+		// Continue observation after involuntary stops so the #246 guard can trigger.
+		// Only skip if voluntarily stopped (user called stop(), not termination failure).
+		const voluntarilyStop = this.#stopped && this.#stoppedAtEpoch === undefined;
+		if (voluntarilyStop || epoch !== this.#epoch) return;
 		const wait = this.#available
 			? this.#interval
 			: Math.min(this.#initialBackoff * 2 ** Math.min(this.#failures++, 20), this.#maxBackoff);
 		this.#timer = setTimeout(() => {
 			this.#timer = undefined;
 			void this.#observe(epoch).then((healthy) => {
+				const now = Date.now();
 				if (healthy) {
 					this.#failures = 0;
 					this.#outageSince = undefined;
 					this.#liveOutageSince = undefined;
+					// If broker became healthy but we're stuck-stopped with unconfirmed child,
+					// check if we should exit. The child must eventually be confirmed or we give up.
+					if (epoch === this.#epoch && this.#stoppedAtEpoch !== undefined && this.#children.size > 0) {
+						const elapsed = now - (this.#stoppedAtTime ?? 0);
+						// Exit if unconfirmed child has been stuck longer than the live outage limit
+						if (elapsed >= this.#liveOutageLimit) {
+							this.#options.onLiveOutageExceeded?.(
+								sanitizeDiagnostic(
+									`owned child unconfirmed for ${Math.floor(elapsed / 1000)}s despite broker health; exiting for systemd restart`,
+								),
+							);
+						}
+					}
 				} else if (epoch === this.#epoch && !this.#stopped) {
 					this.#log(
 						new GjcCliUnavailableError(
 							`global broker unavailable; observing without repair: ${this.#unavailableReason}`,
 						),
 					);
-					this.#noteOutage(Date.now());
+					this.#noteOutage(now);
 				}
 				this.#schedule(epoch);
 			});
