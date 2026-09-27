@@ -353,7 +353,8 @@ export class GlobalGjcClient {
 	}
 	async start(): Promise<void> {
 		if (this.#starting) return this.#starting;
-		if (this.#started) return;
+		// Allow recovery from involuntary stop even if already started
+		if (this.#started && !this.#stopped) return;
 		if (this.#children.size > 0) throw new GjcCliUnavailableError("owned child exit remains unconfirmed");
 		this.#stopped = false;
 		const epoch = ++this.#epoch;
@@ -406,6 +407,14 @@ export class GlobalGjcClient {
 		void child.exited.then(
 			() => {
 				this.#children.delete(child);
+				// If this was the last unconfirmed child from an involuntary stop,
+				// clear the stop markers and attempt recovery via start().
+				if (this.#stoppedAtEpoch !== undefined && this.#children.size === 0) {
+					this.#stoppedAtEpoch = undefined;
+					this.#stoppedAtTime = undefined;
+					// Attempt to restart; if it fails, the client stays stopped for diagnostics.
+					void this.start().catch(() => {});
+				}
 			},
 			() => {},
 		);
@@ -516,19 +525,6 @@ export class GlobalGjcClient {
 					this.#failures = 0;
 					this.#outageSince = undefined;
 					this.#liveOutageSince = undefined;
-					// If broker became healthy but we're stuck-stopped with unconfirmed child,
-					// check if we should exit. The child must eventually be confirmed or we give up.
-					if (epoch === this.#epoch && this.#stoppedAtEpoch !== undefined && this.#children.size > 0) {
-						const elapsed = now - (this.#stoppedAtTime ?? 0);
-						// Exit if unconfirmed child has been stuck longer than the live outage limit
-						if (elapsed >= this.#liveOutageLimit) {
-							this.#options.onLiveOutageExceeded?.(
-								sanitizeDiagnostic(
-									`owned child unconfirmed for ${Math.floor(elapsed / 1000)}s despite broker health; exiting for systemd restart`,
-								),
-							);
-						}
-					}
 				} else if (epoch === this.#epoch && !this.#stopped) {
 					this.#log(
 						new GjcCliUnavailableError(
@@ -536,6 +532,18 @@ export class GlobalGjcClient {
 						),
 					);
 					this.#noteOutage(now);
+				}
+				// Check for unconfirmed child timeout regardless of broker health.
+				// If child is still unconfirmed past the deadline, exit so systemd restarts.
+				if (epoch === this.#epoch && this.#stoppedAtEpoch !== undefined && this.#children.size > 0) {
+					const elapsed = now - (this.#stoppedAtTime ?? 0);
+					if (elapsed >= this.#liveOutageLimit) {
+						this.#options.onLiveOutageExceeded?.(
+							sanitizeDiagnostic(
+								`owned child unconfirmed for ${Math.floor(elapsed / 1000)}s; exiting for systemd restart`,
+							),
+						);
+					}
 				}
 				this.#schedule(epoch);
 			});
